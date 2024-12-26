@@ -1,6 +1,10 @@
 #include <xc.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 #include <adc.h>
+#include <i2c.h>
+#include <math.h>
 #include "LCD_picdem2_2006_XC8.c"
 
 #pragma config WDT = OFF //desactiva watchdog timer
@@ -8,21 +12,27 @@
 #pragma config LVP=OFF //desactiva low voltage program
 
 uint8_t newcycle = 0, count = 0;
-int duty10 = 0, motor_esq = 0, motor_dir = 0;
-char s[10];
+volatile int duty10 = 0, motor_esq = 0, motor_dir = 0, temp = 0;
+char s[10], str_buff[20];
+char new[] = "\n\r";
 
 void main_interrupt(void);
 void setup_AD(void);
+void read_ADC(void);
 void setup_motor(void);
 void motor_velocidade(int vel_esq, int vel_dir);
 long map(long x, long in_min, long in_max, long out_min, long out_max);
+void setup_i2c(void);
+void read_i2c(void);
+void lcd_info(void);
+void my_serial_init(char rate, char hi_speed);
 
 void main_interrupt(void){
-    if (PIR1bits.TMR1IF && PIE1bits.TMR1IE){
+    if (PIR1bits.TMR1IF && PIE1bits.TMR1IE){//Verifica se a flag esta ativa e se o Timer está ativo
         newcycle = 1;
-        TMR1H = 0x3C;
+        TMR1H = 0x3C;//Coloca 15536 = 0x3CB0 nas variaveis de inicio do contador
         TMR1L = 0xB0;
-        PIR1bits.TMR1IF = 0;
+        PIR1bits.TMR1IF = 0;//Reset ha flag
     }
 }
 
@@ -32,47 +42,48 @@ void interrupt high_isr(void){
 
 void main(void){
     
-    RCONbits.IPEN = 1;
-    INTCONbits.GIEH = 1;
-    INTCONbits.GIEL = 1;
+    RCONbits.IPEN = 1;//
+    INTCONbits.GIEH = 1;//
+    INTCONbits.GIEL = 1;//
 
-    setup_AD();
-    setup_motor();
+    setup_AD();//Configura o ADC
+    setup_motor();//Configura o PWM para os motores
+    setup_i2c();//Configura o barramento I2C
+    my_serial_init(25,1);
     
     LCD_init(); // inicia a comunicação com o LCD
     LCD_Clear(); // limpa o lcd
     
+    SetChanADC(ADC_CH0);//Define a entrada de leitura na porta AN0
+    
     while(1){        
         if(newcycle){
-            SetChanADC(ADC_CH0);
-            ConvertADC(); // Inicia a conversão
-            for(;;){ // Espera até o sinal estar convertido
-                if(!BusyADC())
-                    break;
-            }
-            duty10 = ReadADC();
-            motor_esq = map(duty10, 0, 1023, -100, 100);
-            motor_velocidade(motor_esq, motor_esq);
-            itoa(s, motor_esq, 10);
-            LCD_display(1,6, "    ");
-            LCD_display(1,6, s);
-            LCD_display(2,6, "ESQ");
+            read_ADC();//faz leitura do ADC
+            read_i2c();//faz leitura do sensor de temperatura
             
-            itoa(s, duty10, 10);
-            LCD_display(1,1, "    ");
-            LCD_display(1,1, s);
-            LCD_display(2,1, "POT");
+            motor_esq = map(duty10, 0, 1023, -100, 100);//Faz um mapa dos 0<->1023 para de -100<->100
+            motor_dir = map(duty10, 0, 1023, -100, 100);//Faz um mapa dos 0<->1023 para de -100<->100            
+            
+            if (motor_esq > 0)
+                motor_esq += 5;
+            else
+                motor_esq -= 5;
+            
+            motor_velocidade(motor_esq, motor_dir);//controlo da velocidade do motor
+
+            lcd_info();//Imprime todas as imformaçoes necessarias no display
+            sprintf(str_buff, "ME=%d#T=%d\n\r", motor_esq, temp);
+            putsUSART(str_buff);
             newcycle = 0;
         }   
-            //motor_velocidade(motor_esq, motor_dir);
     }
-    CloseADC();
+    CloseADC();//Fecha a leitura do ADC
 }
 
 
 void setup_AD(void){
-    ADCON1 = 0b00001101;
-    TRISAbits.RA0 = 1;
+    ADCON1 = 0b00001101;//Configura as portas AN0 e AN1 como portas analogicas
+    TRISAbits.RA0 = 1;//Define entrada A0 como input 
     
     OpenADC(ADC_FOSC_4 & // Definição do tempo TAD de conversão
         ADC_RIGHT_JUST & // resultado fica nos bits menos significativos
@@ -94,42 +105,45 @@ void setup_AD(void){
     TMR1L = 0xB0;
 }
 
+void read_ADC(void){
+    ConvertADC(); // Inicia a conversão
+    for(;;){ // Espera até o sinal estar convertido
+        if(!BusyADC())
+            break;
+    }
+    duty10 = ReadADC();//Realiza a leitura do ADC
+}
+
 void setup_motor(void){
     TRISCbits.RC1 = 0;
     TRISCbits.RC2 = 0;
     
-    TRISCbits.RC5 = 0;//Pinos de controlo de sentido
+    TRISCbits.RC5 = 0;//Configura os pinos de controlo de sentido
     TRISBbits.RB5 = 0;
     TRISBbits.RB6 = 0;
     TRISBbits.RB7 = 0;
 
     //Configuração do Timer2
-    CCP1CONbits.P1M1 = 0;
-    CCP1CONbits.P1M0 = 0;
+    CCP1CONbits.P1M1 = 0;//Configura PWM1 para modo compativel
+    CCP1CONbits.P1M0 = 0; 
     //1º PWM
-    CCP1CONbits.CCP1M3 = 1;
+    CCP1CONbits.CCP1M3 = 1;//Configura para modo PWM para o PWM1
     CCP1CONbits.CCP1M2 = 1;
     CCP1CONbits.CCP1M1 = 0;
     CCP1CONbits.CCP1M0 = 0;
     //duty cycle variaveis
-    SetDCPWM1(duty10);
-    /*CCPR1L = duty10 >> 2;
-    CCP1CON |= ((duty10 & (1 << 0)) << 4);
-    CCP1CON |= ((duty10 & (1 << 1)) << 5);*/
+    SetDCPWM1(0);//Define o valor de PWM1 a 0
     //2º PWM
-    CCP2CONbits.CCP2M3 = 1;
+    CCP2CONbits.CCP2M3 = 1;//Configura para modo PWM para o PWM1
     CCP2CONbits.CCP2M2 = 1;
     CCP2CONbits.CCP2M1 = 0;
     CCP2CONbits.CCP2M0 = 0;
     
     //duty cycle variaveis
-    SetDCPWM2(duty10);
-    /*CCPR2L = duty10 >> 2;
-    CCP2CON |= ((duty10 & (1 << 0)) << 4);
-    CCP2CON |= ((duty10 & (1 << 1)) << 5);*/
+    SetDCPWM2(0);//Define o valor de PWM2 a 0
     
     PR2 = 249;
-    T2CONbits.TMR2ON = 1;
+    T2CONbits.TMR2ON = 1;//Ativa Timer2
     T2CONbits.T2CKPS1 = 0;//PS = 4 || PR2 = (1/(1e3))/(4*(1/4e6)*4)-1 = 249
     T2CONbits.T2CKPS0 = 1;
     
@@ -137,94 +151,89 @@ void setup_motor(void){
 }
 
 void motor_velocidade(int vel_esq, int vel_dir){
-    if (vel_esq < -5 && vel_esq >= -100){
+    if (vel_esq < -10 && vel_esq >= -105){//verifica se é para por o motor a rodar no sentido horario, anti-horario e quando parar
         LATCbits.LATC5 = 1;
         LATBbits.LATB5 = 0;
         LATBbits.LATB6 = 1;
         LATBbits.LATB7 = 0;
-        SetDCPWM1(map(vel_esq, -5, -100, 0, 1000));
-        SetDCPWM2(map(vel_dir, -5, -100, 0, 1000)); 
     }
-    else if(vel_esq > 5 && vel_esq <= 100){
+    else if(vel_esq > 10 && vel_esq <= 105){
         LATCbits.LATC5 = 0;
         LATBbits.LATB5 = 1;
         LATBbits.LATB6 = 0;
         LATBbits.LATB7 = 1;
-        SetDCPWM1(map(vel_dir, 5, 100, 0, 1000));
-        SetDCPWM2(map(vel_dir, 5, 100, 0, 1000)); 
     }
     else{
         LATCbits.LATC5 = 0;
         LATBbits.LATB5 = 0;
         LATBbits.LATB6 = 0;
         LATBbits.LATB7 = 0;
-        SetDCPWM1(0);
-        SetDCPWM2(0);
     }
-    
-    /*if (duty10 >= 520){
-                motor_esq = map(duty10, 520, 1023, 1, 1000);
-                
-                itoa(s, motor_esq, 10);
-                LCD_display(1,6, "   ");
-                LCD_display(1,6, s);
-                LCD_display(2,6, "ESQ");
-
-                LATCbits.LATC5 = 0;
-                LATBbits.LATB5 = 1;
-                SetDCPWM1(motor_esq);
-                
-                motor_dir = map(duty10, 520, 1023, 1, 1000);
-                
-                itoa(s, motor_dir, 10);
-                LCD_display(1, 10, "   ");
-                LCD_display(1, 10, s);
-                LCD_display(2, 10, "DIR");
-
-                LATBbits.LATB6 = 0;
-                LATBbits.LATB7 = 1;
-                
-                SetDCPWM2(motor_dir); 
-            }
-            else if (duty10 <= 480){
-                motor_esq = map(duty10, 480, 1, 1, 1000);
-                
-                itoa(s, motor_esq, 10);
-                LCD_display(1,6, "   ");
-                LCD_display(1,6, s);
-                LCD_display(2,6, "ESQ");
-                
-                LATCbits.LATC5 = 1;
-                LATBbits.LATB5 = 0; 
-                SetDCPWM1(motor_esq);
-                
-                motor_dir = map(duty10, 480, 1, 1, 1000);
-                
-                itoa(s, motor_dir, 10);
-                LCD_display(1, 10, "   ");
-                LCD_display(1, 10, s);
-                LCD_display(2, 10, "DIR");
-
-                LATBbits.LATB6 = 1;
-                LATBbits.LATB7 = 0;
-                SetDCPWM2(motor_dir); 
-                
-            }
-            else{
-                motor_esq = 0;
-                motor_dir = 0;
-                motor_velocidade(motor_esq, motor_dir);
-                LATCbits.LATC5 = 0;
-                LATBbits.LATB5 = 0;
-                LATBbits.LATB6 = 0;
-                LATBbits.LATB7 = 0;
-         }*/
+    SetDCPWM1(vel_esq > 0 ? map(vel_esq, 10, 105, 0, 1000) : map(vel_esq, -10, -105, 0, 1000));
+    SetDCPWM2(vel_dir > 0 ? map(vel_dir, 10, 100, 0, 1000) : map(vel_dir, -10, -100, 0, 1000));
 }
 
 
 long map(long x, long in_min, long in_max, long out_min, long out_max){
-  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;//Função que converte um intervalo noutro
+  //#thank_you_Arduino
+}
+
+void setup_i2c(void){
+    OpenI2C(MASTER, SLEW_OFF);//Inicia o protocolo de I2C ha frequencia de 100KHz e como Master
+    SSPADD = 9;//valor obtido para FOSC=4MHz e clock 100 KHz
+}
+
+void read_i2c(){
+    StartI2C();//Inicia a comunicação com os sensores ou dispositivos pelo barramento I2C
+    WriteI2C(0x9A); //escreve o endereço do sensor ? devolve 1 se a escrita tiver sido sucedida
+    WriteI2C(0x00); // comando para ler temperatura
+    RestartI2C(); //permite enviar novo comando sem fazer o StopI2C
+    WriteI2C(0x9B); //pedido de leitura
+    temp = ReadI2C(); //le o valor da temperatura medido pelo sensor
+    StopI2C();//Termina comunicação com os sensores ou dispositivos pelo barramento I2C
+}
+
+void lcd_info(void){
+    itoa(s, temp, 10);
+    LCD_display(1,14, "   ");
+    LCD_display(1,15,s);//Imprime informação sobre a temperatura lida pelo sensor
+    LCD_display(2,15,"*C");
+    
+    itoa(s, motor_esq, 10);
+    LCD_display(1,6, "    ");
+    LCD_display(1,6, s);//Imprime velocidade do motor
+    LCD_display(2,6, "ESQ");
+            
+    itoa(s, motor_dir, 10);
+    LCD_display(1,10, "    ");
+    LCD_display(1,10, s);//Imprime velocidade do motor
+    LCD_display(2,10, "DIR");
+            
+    itoa(s, duty10, 10);
+    LCD_display(1,1, "    ");
+    LCD_display(1,1, s);//Imprime valor lido pelo potenciometro
+    LCD_display(2,1, "POT");
+           
 }
 
 
-
+void my_serial_init(char rate, char hi_speed){
+    //transmissão
+    TXSTAbits.TX9 = 0; // bloco de dados de apenas 8 bits
+    TXSTAbits.TXEN = 1; // modo de transmissão ativado
+    TXSTAbits.SYNC = 0; // USART em modo assíncrono
+    //baud rate
+    if (hi_speed) TXSTAbits.BRGH = 1; // modo de hi speed
+    else TXSTAbits.BRGH =0; // modo baixa velocidade
+    BAUDCONbits.BRG16 =0; //gerador de 8 bits utiliza apenas o SPBRG
+    SPBRG=rate; // registo de baud rate
+    //configuracao de bits
+    TRISC |= (1 << 7); // RC7 input
+    TRISC &= ~(1 << 6); // RC6 output
+    //receção
+    RCSTAbits.RX9 = 0; // bloco de dados de 8 bits
+    RCSTAbits.CREN = 0; // é limpo para limpar OERR (overrun)
+    RCSTAbits.CREN = 1; // ativa a receção continuous receive
+    RCSTAbits.SPEN = 1; // serial port enable
+}
