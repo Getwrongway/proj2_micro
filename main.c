@@ -11,8 +11,9 @@
 #pragma config OSC = HS //HS oscilador highspeed
 #pragma config LVP=OFF //desactiva low voltage program
 
-uint8_t newcycle = 0, count = 0;
-volatile int duty10 = 0, motor_esq = 0, motor_dir = 0, temp = 0;
+uint8_t newcycle = 0, count = 0, add_count = 0, dis[3];
+volatile int duty10 = 0, temp = 0, address[10], distancia = 0;
+long motor_esq = 0, motor_dir = 0;
 char s[10], str_buff[20];
 char new[] = "\n\r";
 
@@ -20,12 +21,14 @@ void main_interrupt(void);
 void setup_AD(void);
 void read_ADC(void);
 void setup_motor(void);
-void motor_velocidade(int vel_esq, int vel_dir);
+void motor_velocidade(long vel_esq, long vel_dir);
 long map(long x, long in_min, long in_max, long out_min, long out_max);
 void setup_i2c(void);
 void read_i2c(void);
 void lcd_info(void);
 void my_serial_init(char rate, char hi_speed);
+void find_i2c_address(void);
+void read_sonar(int address);
 
 void main_interrupt(void){
     if (PIR1bits.TMR1IF && PIE1bits.TMR1IE){//Verifica se a flag esta ativa e se o Timer está ativo
@@ -50,6 +53,7 @@ void main(void){
     setup_motor();//Configura o PWM para os motores
     setup_i2c();//Configura o barramento I2C
     my_serial_init(25,1);
+    find_i2c_address();
     
     LCD_init(); // inicia a comunicação com o LCD
     LCD_Clear(); // limpa o lcd
@@ -60,7 +64,9 @@ void main(void){
         if(newcycle){
             read_ADC();//faz leitura do ADC
             read_i2c();//faz leitura do sensor de temperatura
-            
+            for(int i = 0; i < add_count; i++){        
+                read_sonar(address[i]);
+            }
             motor_esq = map(duty10, 0, 1023, -100, 100);//Faz um mapa dos 0<->1023 para de -100<->100
             motor_dir = map(duty10, 0, 1023, -100, 100);//Faz um mapa dos 0<->1023 para de -100<->100            
             
@@ -69,11 +75,23 @@ void main(void){
             else
                 motor_esq -= 5;
             
-            motor_velocidade(motor_esq, motor_dir);//controlo da velocidade do motor
-
             lcd_info();//Imprime todas as imformaçoes necessarias no display
-            sprintf(str_buff, "ME=%d#T=%d\n\r", motor_esq, temp);
+            //sprintf(str_buff, "ME:%d#T:%d#DIS:%d#ADDR:%d\n\r", motor_dir, temp, distancia, address[0]);
+            itoa(str_buff, motor_dir, 10);
             putsUSART(str_buff);
+            putsUSART(new);
+            itoa(str_buff, temp, 10);
+            putsUSART(str_buff);
+            putsUSART(new);
+            itoa(str_buff, distancia, 10);
+            putsUSART(str_buff);
+            putsUSART(new);
+            itoa(str_buff, address[0], 10);
+            putsUSART(str_buff);
+            putsUSART(new);
+            
+            motor_velocidade(motor_esq, motor_dir);//controlo da velocidade do motor
+            
             newcycle = 0;
         }   
     }
@@ -150,14 +168,14 @@ void setup_motor(void){
     //duty cycle = (PR2+1)*4 = 250*4 = 1000 <--- max value of pwm
 }
 
-void motor_velocidade(int vel_esq, int vel_dir){
-    if (vel_esq < -10 && vel_esq >= -105){//verifica se é para por o motor a rodar no sentido horario, anti-horario e quando parar
+void motor_velocidade(long vel_esq, long vel_dir){
+    if (vel_dir < -10 && vel_dir >= -100){//verifica se é para por o motor a rodar no sentido horario, anti-horario e quando parar
         LATCbits.LATC5 = 1;
         LATBbits.LATB5 = 0;
         LATBbits.LATB6 = 1;
         LATBbits.LATB7 = 0;
     }
-    else if(vel_esq > 10 && vel_esq <= 105){
+    else if(vel_dir > 10 && vel_dir <= 100){
         LATCbits.LATC5 = 0;
         LATBbits.LATB5 = 1;
         LATBbits.LATB6 = 0;
@@ -236,4 +254,36 @@ void my_serial_init(char rate, char hi_speed){
     RCSTAbits.CREN = 0; // é limpo para limpar OERR (overrun)
     RCSTAbits.CREN = 1; // ativa a receção continuous receive
     RCSTAbits.SPEN = 1; // serial port enable
+}
+
+void find_i2c_address(void){
+    for(int i = 226; i < 255; i+=2){
+        StartI2C();
+        if(!WriteI2C(i)){
+            address[add_count] = i;
+            add_count++;
+        }
+        StopI2C();
+    }
+}
+void read_sonar(int address){
+    StartI2C();
+    WriteI2C(address);
+    WriteI2C(0x00);
+    WriteI2C(0x51);
+    StopI2C();
+    Delay1KTCYx(70);
+    StartI2C();
+    WriteI2C(address);
+    WriteI2C(0x02);
+    RestartI2C();
+    WriteI2C(address + 1);
+    while( getsI2C(dis,2) );
+    dis[2] = '\0';
+    NotAckI2C();
+    StopI2C();
+    
+    distancia = dis[0];
+    distancia = distancia << 8;
+    distancia |= dis[1];
 }
